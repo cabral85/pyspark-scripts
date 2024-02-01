@@ -8,15 +8,19 @@ from pyspark.sql import DataFrame
 from pyspark.sql.utils import AnalysisException
 
 
-class DataUtils:
+class DataProcessor:
     def __init__(self, environment: Optional[str] = "dev"):
         self.environment = environment
+        self.bucket = "my-bucket"
         self.glue_client = boto3.client("glue")
+
+        spark.sql(f"USE {environment}")
 
 
     def read_data(
-            self, 
+            self,
             table_name: str,
+            source_catalog: Optional[str] = None,
             partition_values: Optional[Dict] = None
         ) -> DataFrame:
         """
@@ -27,8 +31,11 @@ class DataUtils:
         :param partition_values (Optional[Dict]): Os valores das partições a serem usadas
         :return: O DataFrame
         """
+
+        if not source_catalog:
+            source_catalog = self.environment
         
-        df = spark.table(f"{self.environment}_{table_name}")
+        df = spark.table(f"{source_catalog}.{table_name}")
 
         if partition_values:
             partition_filters = [f"{key} = '{value}'" for key, value in partition_values.items()]
@@ -55,9 +62,6 @@ class DataUtils:
         :param options (Optional[Dict]): As opções a serem usadas
         """
 
-        catalog = table_name.split(".")[0]
-        spark.sql(f"USE {catalog}")
-
         writer = df.write.format("parquet")
         if partitions:
             writer = writer.partitionBy(partitions)
@@ -71,19 +75,22 @@ class DataUtils:
 
     def copy_data(
             self, 
-            table_name: str, 
-            target_table_name: Optional[str], 
-            months_of_data: Optional[str] = None
+            source_table_name: str, 
+            source_catalog: str,
+            target_table_name: str, 
+            months_of_data: Optional[str] = None,
+            mode: Optional[str] = "append"
         ) -> None:
         """
         Função utilizada para copiar dados de uma tabela para outra
 
-        :param table_name (str): O nome da tabela a ser copiada
-        :param target_table_name (Optional[str]): O nome da tabela de destino
+        :param source_table_name (str): O nome da tabela a ser copiada
+        :param source_catalog (str): O nome do catálogo de origem
+        :param target_table_name (str): O nome da tabela de destino
         :param months_of_data (Optional[str]): A quantidade de meses de dados a serem copiados
         
         """
-        partition_columns = self.get_partition_columns(table_name)
+        partition_columns = self.get_partition_columns(source_catalog, source_table_name)
 
         partition_values = {}
         if months_of_data and {"year", "month", "day"}.issubset(set(partition_columns)):
@@ -94,17 +101,16 @@ class DataUtils:
                 "day": f"{date_from.day:02d}"
             }
 
-        source_df = self.read_data(table_name=table_name, partition_values=partition_values)
+        source_df = self.read_data(table_name=source_table_name, partition_values=partition_values)
 
-        if not target_table_name:
-            target_table_name = table_name
-
-        self.write_data(source_df, table_name=target_table_name, partition=partition_columns, mode="overwrite")
+        self.write_data(source_df, table_name=target_table_name, partition=partition_columns, mode=mode)
 
 
     def create_sample_data(
             self, 
             table_name: str, 
+            source_catalog: str,
+            sufix: Optional[str] = "_sample",
             partition_values: Optional[Dict] = None, 
             percent: Optional[float] = 0.1
         ) -> None:
@@ -112,38 +118,47 @@ class DataUtils:
         Função utilizada para criar uma amostra dos dados de uma tabela
 
         :param table_name (str): O nome da tabela a ser amostrada
+        :param source_catalog (str): O nome do catálogo de origem
+        :param sufix (Optional[str]): O sufixo a ser adicionado ao nome da tabela
         :param partition_values (Optional[Dict]): Os valores das partições a serem usadas
+        :param percent (Optional[float]): A porcentagem de amostragem
         """
         try:
             df = self.read_data(
                 table_name=table_name,
+                source_catalog=source_catalog,
                 partition_values=partition_values
             )
-
-            catalog_name = table_name.split(".")[0]
-            spark.sql(f"USE {catalog_name}")
             
-            (
-                self.write_data(
-                    df.sample(False, percent), 
-                    table_name=f"{table_name}_sample",
-                )
+            self.write_data(df.sample(False, percent),table_name=f"{table_name}{sufix}"
             )
         except AnalysisException as e:
             print(f"Error reading data: {e}")
+
+
+    def create_glue_catalog(self, catalog_name: str) -> None:
+        """
+        Função utilizada para criar um catálogo no Glue
+
+        :param catalog_name (str): O nome do catálogo
+        """
+        try:
+            location = f"s3://{self.bucket}/{self.environment}/{catalog_name}"
+            self.glue_client.create_database(DatabaseInput={"Name": catalog_name, "LocationUri": location})
+        except Exception as e:
+            print(f"Error creating catalog: {e}")
     
 
-    def get_partition_columns(self, table_name: str) -> List[str]:
+    def get_partition_columns(self, catalog_name: str, table_name: str) -> List[str]:
         """
         Busca as colunas de partição de uma tabela
 
+        :param catalog_name (str): O nome do catálogo
         :param table_name (str): O nome da tabela
         :return: A lista de colunas de partição
         """
         try:
-            database_name = table_name.split(".")[0]
-            table_name = table_name.split(".")[1]
-            response = self.glue_client.get_table(DatabaseName=database_name, TableName=table_name)
+            response = self.glue_client.get_table(DatabaseName=catalog_name, TableName=table_name)
             partition_keys = response["Table"]["PartitionKeys"]
             return [key["Name"] for key in partition_keys]
         except Exception as e:
